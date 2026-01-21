@@ -1,0 +1,18 @@
+{
+  "flat": {
+    "available": 7435,
+    "sampled": 50
+  },
+  "moderate": {
+    "available": 490,
+    "sampled": 50
+  },
+  "steep": {
+    "available": 1864,
+    "sampled": 50
+  },
+  "null": {
+    "available": 72913,
+    "sampled": 50
+  }
+}

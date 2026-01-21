@@ -1,0 +1,432 @@
+import common
+import pandas as pd
+import re
+import glob as glob
+import os.path as path
+import os
+import numpy as np
+import anthropic
+
+READ_DIR = common.OUTPUT_DIR
+OUTPUT_DIR = common.IS_DATA_V3_DIR
+BATCH_RUN_DECADE_DIR = common.IS_DATA_V3_BATCH_RUN_DIR
+
+# Hardcoded batch IDs from the Jan 20, 2026 batch runs
+BATCH_IDS = {
+    '197': 'msgbatch_018m3RuBmU37XMuoGzj2FSKi',
+    '198': 'msgbatch_01He4Kz6NrAHNSjeVVRvTeno',
+    '199': 'msgbatch_017bDkNAwoPPQGFGvhWcDLqc',
+    '200': 'msgbatch_017jFtwSZjD9V6YHPwbRgkU4',
+    '201_1': 'msgbatch_01KYiKUgxbSTszk6tW6sbMzH',
+    '201_2': 'msgbatch_014GgFdvVuR5hZit8PXLa5qE',
+}
+
+
+def get_argument_df():
+    filepath = f'{READ_DIR}/all_arguments.pkl'
+    df = pd.read_pickle(filepath)
+    return df[df.variable.isin(['Growth', 'Inflation', 'Employment'])]
+
+
+def get_prompt(argument):
+    prompt_1 = f"""
+    You are tasked with extracting and classifying IS curve beliefs from Federal Open Market Committee (FOMC) speaker statements. The IS curve describes the relationship between monetary policy (interest rates) and real economic output/growth.
+
+    ## Your Task
+
+    Classify the speaker's IS curve belief based on their quote. You must determine whether the speaker believes that monetary policy significantly affects output, has little effect, has a moderate effect, or if no belief is expressed.
+
+    ## Classification Categories
+
+    **FLAT**: The speaker indicates that output is HIGHLY SENSITIVE to monetary policy changes.
+
+    **STEEP**: The speaker indicates that output has LITTLE or NO response to monetary policy changes.
+
+    **MODERATE**: The speaker indicates a QUALIFIED or PARTIAL transmission from policy to output.
+
+    **NULL**: The speaker does NOT express an IS curve belief (this is the default).
+
+    ---
+
+    ## Classification Process
+
+    Follow this systematic process to classify the quote:
+
+    ### Step 1: Check for Explicit Transmission Mentions
+
+    If the quotation explicitly discusses policy transmission effectiveness, classify as follows:
+
+    - "policy is gaining traction / working / biting" → FLAT
+    - "pushing on a string / transmission impaired / channels clogged" → STEEP
+    - "some effect but limited / modest transmission" → MODERATE
+
+    If there is an explicit mention with a clear view, proceed directly to classification. Otherwise, continue to Step 2.
+
+    ### Step 2: Identify Required Components
+
+    For an IS curve belief to be present, the quote must mention BOTH:
+
+    **MONETARY POLICY INDICATORS** (at least one):
+    - Interest rates, policy rate, fed funds rate, funds rate
+    - Rate increases/hikes/tightening, rate cuts/easing
+    - Policy stance: tight/restrictive/easy/accommodative
+    - Real rates, policy restraint/stimulus
+    - Monetary conditions, policy actions
+    - Money supply, money growth, monetary aggregates
+    - Balance sheet policies, asset purchases, QE
+
+    **OUTPUT/GROWTH OUTCOMES** (at least one):
+    - GDP, output, economic growth, real activity
+    - Aggregate demand, spending, consumption, investment
+    - Interest-sensitive sectors (housing, durables, capex)
+    - Economic slowdown, recession risk, expansion
+    - Business activity, economic momentum
+
+    **If BOTH components are NOT present, classify as NULL.**
+
+    ### Step 3: Identify Causal Connection
+
+    If both components are present, determine whether the speaker connects them causally. Simply mentioning both concepts without linking them is NOT sufficient.
+
+    **Signs of NO causal connection (classify as NULL):**
+    - Only describes data without interpreting policy transmission
+    - Discusses policy decisions without explaining the mechanism
+    - Forecasts growth without attributing it to policy
+    - Mentions both concepts in separate contexts
+
+    **Signs of causal connection (proceed to Step 4):**
+    - Uses causal language linking policy to output
+    - Expresses concern about policy effects on growth
+    - Shows surprise at presence or absence of expected effects
+    - Explains mechanism by which policy affects activity
+
+    ### Step 4: Classify the Type of Relationship
+
+    If a causal connection exists, classify based on language and signal words:
+
+    ---
+
+    #### FLAT Classification
+
+    Use when the speaker indicates output is HIGHLY SENSITIVE to monetary policy.
+
+    **Strong indicators:**
+    - **Causal language:** "rate hikes are slowing," "policy is restraining," "tightening is reducing"
+    - **Traction language:** "gaining traction," "working through," "taking hold," "biting"
+    - **Concern about overtightening:** "risk of slowing too much," "could tip into recession"
+    - **Sector effects attributed to policy:** "housing is weakening due to rates," "investment responding to policy"
+    - **Effectiveness affirmation:** "policy is working," "already seeing impact," "easing providing support"
+
+    **Examples:**
+    - "Our rate increases are clearly slowing interest-sensitive sectors"
+    - "Policy tightening is gaining traction and restraining demand"
+    - "Further rate hikes risk tipping the economy into recession"
+    - "The 200 basis points of easing is providing significant support to growth"
+    - "Lower rates in mortgages are bolstering housing prices"
+    - "When the Federal Reserve decided to let up, conditions began to rebound"
+
+    ---
+
+    #### STEEP Classification
+
+    Use when the speaker indicates output is RELATIVELY INSENSITIVE to monetary policy.
+
+    **Strong indicators:**
+    - **Resilience despite policy:** "despite tightening, growth continues," "resilient to rate increases," "even as we reduce accommodation"
+    - **Impairment language:** "transmission impaired," "channels clogged," "pushing on a string," "pipeline not full"
+    - **Skepticism:** "less effect than expected," "not seeing impact," "won't work," "cannot produce growth"
+    - **Liquidity trap references:** "liquidity trap," "zero bound ineffective"
+    - **Other factors dominate:** "fiscal policy driving growth," "structural factors," "global forces"
+
+    ** CRITICAL PATTERN - "Despite/Even as" Construction:**
+    When speakers note that economic performance continues DESPITE or EVEN AS policy changes, this indicates STEEP:
+    - "even with several more rate increases, the economy should expand 3.5-4%" → STEEP
+    - "maintained solid momentum even as we reduce policy accommodation" → STEEP
+    - "growth seems solid and resilient and in less need of accommodation" → STEEP
+
+    The key insight: if growth continues regardless of policy direction, output is insensitive to policy.
+
+    **Examples:**
+    - "Despite 300 basis points of tightening, growth remains above trend"
+    - "The economy has proven surprisingly resilient to higher rates"
+    - "We simply do not have the capability to produce higher real growth through accommodative policy"
+    - "With credit channels impaired, monetary policy is pushing on a string"
+    - "Business fixed investment has remained consistently weaker despite balance sheet policies"
+    - "A further 25 basis point cut will do nothing to change the near-term outlook"
+
+    ---
+
+    #### MODERATE Classification
+
+    Use when the speaker indicates a QUALIFIED or PARTIAL transmission effect.
+
+    **Strong indicators:**
+    - **Hedging:** "some," "modest," "incremental," "limited," "to some extent"
+    - **Mixed channels:** works in some sectors but not others
+    - **Conditionality:** "depends on," "in certain circumstances," "may"
+    - **Weakening transmission:** "less than before," "diminished effect"
+
+    **Examples:**
+    - "An incremental prod towards activity in the real economy"
+    - "Policies likely contributed to mortgage and auto borrowing, but business investment remained weak"
+    - "We see limited passthrough from policy to spending"
+    - "Some transmission is occurring, but effects are modest"
+
+    ---
+
+    ### Step 5: Handle Special Cases
+
+    #### Forecasts and Projections
+    Only classify if the reasoning reveals IS curve logic:
+    - "I forecast slower growth" → NULL (no mechanism stated)
+    - "I forecast slower growth because policy is restrictive" → FLAT
+
+    #### Policy Recommendations Without Mechanism
+    - "We should raise rates" → NULL (no transmission belief)
+    - "We should pause because hikes are already slowing the economy" → FLAT
+
+    #### Historical References
+    Only classify if the speaker endorses or rejects the transmission:
+    - "Growth slowed in 1982" → NULL (just description)
+    - "The 1982 episode showed how powerfully rate hikes affect output" → FLAT
+
+    #### Lag Discussions
+    - "Effects in 2-3 quarters" → indicates transmission is working (FLAT)
+    - "Won't see effects for 2+ years" → weak near-term transmission (STEEP)
+    - "Long and variable lags" without specifics → default to NULL
+
+    #### Inflation Channel vs Output Channel
+    Only classify if OUTPUT effects are discussed:
+    - "Rate hikes will reduce inflation" → NULL (inflation channel only)
+    - "Rate hikes will slow growth and thus reduce inflation" → FLAT (output channel explicit)
+    - "Tightening will cool demand" → FLAT (demand = output)
+
+    ---
+
+    ## Critical Disambiguation Rules
+
+    ### 1. "Resilient" and "Solid Growth" Language
+
+    When speakers describe the economy as "resilient," "solid," or "maintaining momentum" in the context of policy changes, determine:
+
+    - **If despite policy:** "solid growth DESPITE tightening" → STEEP
+    - **If because of policy:** "solid growth BECAUSE of accommodation" → FLAT
+    - **If unconnected:** "solid growth" (no policy mention) → NULL
+
+    ### 2. Distinguishing IS Slope from Policy Preference
+
+    A member can believe the IS curve is flat and support either restriction or accommodation.
+    - Accommodative + flat: "We should cut because lower rates will meaningfully boost growth"
+    - Restrictive + flat: "We should pause because our hikes are already slowing the economy"
+    - Accommodative + steep: "Cutting won't help much—the problems aren't monetary"
+    - Restrictive + steep: "We can keep tightening—the economy is resilient to rate increases"
+
+    **Focus on the TRANSMISSION BELIEF, not the policy preference.**
+
+    ### 3. "Need for" vs "Effect of" Policy
+
+    - "We need more accommodation" → NULL (preference, not transmission belief)
+    - "We need more accommodation to boost growth" → FLAT (causal claim)
+    - "Economy needs less accommodation now" → NULL unless connected to policy already working
+
+    ---
+
+    ## Output Format
+
+    Provide your classification in well-formed XML format:
+    ```xml
+    <classification>
+    <is_slope>[steep|flat|moderate|null]</is_slope>
+    <reasoning>[Brief explanation in 1-2 sentences referencing key phrases from the quote]</reasoning>
+    </classification>
+    ```
+
+    **IMPORTANT REMINDERS:**
+    - Default to NULL unless the speaker clearly expresses a belief about how monetary policy affects output/growth
+    - Watch for the "despite/even as" construction - this typically indicates STEEP
+    - "Resilient" in the context of policy changes indicates STEEP
+    - Your reasoning must cite specific phrases from the quotation
+    - Your XML output must be well-formed and machine-readable
+    """
+
+    prompt_2 = f"""
+    Here is the economic argument you need to analyze:
+    <economic_argument>
+    {argument}
+    </economic_argument>
+    """
+
+    return prompt_1, prompt_2
+
+
+def get_all_prompts_by_decade(decade, argument_df=None):
+    if argument_df is None:
+        argument_df = get_argument_df()
+
+    argument_df = argument_df[argument_df.ymd.str.startswith(str(decade))]
+
+    prompts = {rownum: get_prompt(argument_df.loc[[rownum]][['quotation', 'description', 'explanation']].to_csv()) for rownum in argument_df.index}
+    return prompts
+
+
+def run_all_prompts_by_decade(decade):
+    if decade == '201':
+        # Split prompts into two batches
+        all_prompts = get_all_prompts_by_decade(decade)
+        prompt_items = list(all_prompts.items())
+        mid_point = len(prompt_items) // 2
+
+        # Split into two batches
+        prompts_batch_1 = dict(prompt_items[:mid_point])
+        prompts_batch_2 = dict(prompt_items[mid_point:])
+
+        # Run first batch
+        result_1 = common.run_all_prompts(lambda: prompts_batch_1, output_dir=f'{BATCH_RUN_DECADE_DIR}/{decade}_1',
+                                         caching=True)
+
+        # Run second batch
+        result_2 = common.run_all_prompts(lambda: prompts_batch_2, output_dir=f'{BATCH_RUN_DECADE_DIR}/{decade}_2',
+                                         caching=True)
+
+        # Return both results (caller will need to handle both)
+        return (result_1, result_2)
+    else:
+        return common.run_all_prompts(lambda: get_all_prompts_by_decade(decade), output_dir=f'{BATCH_RUN_DECADE_DIR}/{decade}',
+                                     caching=True)
+
+
+def save_all_prompts_by_decade(decade, id_mapping, submitted_requests):
+    return common.save_submitted_request_responses_meeting(id_mapping, submitted_requests, output_dir=f'{OUTPUT_DIR}/{decade}',)
+
+
+def save_all_prompts():
+    for decade in ['197', '198', '199', '200']:
+        id_mapping, submitted_requests = pd.read_pickle(f'{BATCH_RUN_DECADE_DIR}/{decade}/all.pkl')
+        save_all_prompts_by_decade(decade, id_mapping, submitted_requests)
+
+    for i in [1, 2]:
+        id_mapping, submitted_requests = pd.read_pickle(f'{BATCH_RUN_DECADE_DIR}/201_{i}/all.pkl')
+        save_all_prompts_by_decade(f'201', id_mapping, submitted_requests)
+
+
+def download_batches():
+    """
+    Download batch results using hardcoded batch IDs.
+    This function recreates the id_mapping from the argument dataframe and downloads
+    results directly using the batch IDs from BATCH_IDS.
+    """
+    client = anthropic.Anthropic(api_key=common.API_KEY)
+    argument_df = get_argument_df()
+
+    for decade_key, batch_id in BATCH_IDS.items():
+        # Determine the actual decade (without _1 or _2 suffix) for filtering
+        decade = decade_key.split('_')[0]
+
+        # Get the prompts for this decade to reconstruct id_mapping
+        decade_df = argument_df[argument_df.ymd.str.startswith(str(decade))]
+        rownums = list(decade_df.index)
+
+        # For 201 decade, split the rownums
+        if decade_key == '201_1':
+            mid_point = len(rownums) // 2
+            rownums = rownums[:mid_point]
+        elif decade_key == '201_2':
+            mid_point = len(rownums) // 2
+            rownums = rownums[mid_point:]
+
+        # Create id_mapping: {1: rownum1, 2: rownum2, ...}
+        id_mapping = {i+1: rownum for i, rownum in enumerate(rownums)}
+
+        # Create output directory
+        output_decade = '201' if decade_key.startswith('201') else decade_key
+        output_dir = f'{OUTPUT_DIR}/{output_decade}'
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        print(f"Downloading batch {batch_id} for decade {decade_key}...")
+
+        # Get batch results
+        batch_responses = client.messages.batches.results(batch_id)
+
+        count = 0
+        for batch_response in batch_responses:
+            custom_id = batch_response.custom_id
+            rownum = id_mapping[int(custom_id)]
+
+            if hasattr(batch_response.result, 'error'):
+                print(f"  Error for rownum {rownum}: {batch_response.result.error}")
+                continue
+
+            response = batch_response.result.message.content[0].text
+            filepath = f'{output_dir}/{rownum}.txt'
+
+            with open(filepath, 'w') as f:
+                f.write(response)
+            count += 1
+
+        print(f"  Saved {count} responses to {output_dir}")
+
+
+def parse_classification_output(text):
+    """
+    Parse IS curve classification output using regular expressions and return a pandas Series.
+
+    Args:
+        text (str): The XML-like classification output string
+
+    Returns:
+        pd.Series: Parsed classification data with 'is_slope' and 'reasoning' fields
+    """
+    # If a <classification>...</classification> block exists, focus on it
+    m_block = re.search(r"<classification\b[^>]*>(.*)</classification>",
+                        text, flags=re.IGNORECASE | re.DOTALL)
+    if m_block:
+        text = m_block.group(1)
+
+    # Define regex patterns for each field (non-greedy, case-insensitive, dot matches newlines)
+    patterns = {
+        'is_slope': r'<is_slope>(.*?)</is_slope>',
+        'reasoning':      r'<reasoning>(.*?)</reasoning>',
+    }
+
+    # Extract values using regex
+    extracted_values = {}
+    for field, pattern in patterns.items():
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        extracted_values[field] = match.group(1).strip() if match else None
+
+    # Return as pandas Series (order preserved from the dict)
+    return pd.Series(extracted_values)
+
+
+def parse_all_classification_output(use_cache=True):
+    filepath = f'{OUTPUT_DIR}/is_classifications.pkl'
+    if path.isfile(filepath) and use_cache:
+        return pd.read_pickle(filepath)
+
+    is_map = {
+        'null': np.nan,
+        'steep': -1,
+        'flat': 1,
+        'moderate': 0
+    }
+
+    result = dict()
+    files = glob.glob(f'{OUTPUT_DIR}/*/*.txt')
+    for f in files:
+        text = open(f).read()
+        classification = parse_classification_output(text)
+        rownum = f.split('/')[-1].replace('.txt', '')
+        result[int(rownum)] = is_map[classification['is_slope']]
+
+    result = pd.Series(result).T
+    pd.to_pickle(result, filepath)
+    return result
+
+
+def read_arguments_with_classification_output():
+    arguments = get_argument_df()
+    is_classification = parse_all_classification_output()
+    arguments['is_slope'] = is_classification
+    arguments['ymd'] = pd.to_datetime(arguments['ymd'])
+    return arguments
